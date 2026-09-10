@@ -49,7 +49,7 @@ async def startup_event():
     try:
         logger.info("Testing Firestore connection...")
         from firebase_admin import firestore
-        fs_client = firestore.Client(project="codepulse-507023")
+        fs_client = firestore.Client(project="codepulse-507023", database="codepulse")
         # Simple query to verify connectivity
         collection_ref = fs_client.collection("analysis_cache")
         docs = collection_ref.limit(1).stream()

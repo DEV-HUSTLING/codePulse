@@ -18,7 +18,7 @@ def init_db():
         if not firebase_admin._apps:
             # Use default credentials (automatically detects GOOGLE_APPLICATION_CREDENTIALS)
             firebase_admin.initialize_app()
-        db = firestore.Client(project="codepulse-507023")
+        db = firestore.Client(project="codepulse-507023", database="codepulse")
         logger.info("✓ Firestore initialized successfully")
     except Exception as e:
         logger.error(f"✗ Failed to initialize Firestore: {e}")
