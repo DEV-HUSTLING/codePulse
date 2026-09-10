@@ -3,9 +3,7 @@ import json
 import logging
 from typing import Optional, Dict, Any, List
 from datetime import datetime
-import firebase_admin
-from firebase_admin import credentials, firestore
-
+from google.cloud import firestore
 logger = logging.getLogger(__name__)
 
 # Initialize Firestore
@@ -15,15 +13,15 @@ def init_db():
     """Initialize Firestore connection (called once at startup)."""
     global db
     try:
-        if not firebase_admin._apps:
-            # Use default credentials (automatically detects GOOGLE_APPLICATION_CREDENTIALS)
-            firebase_admin.initialize_app()
-        db = firestore.Client(project="codepulse-507023", database="codepulse")
+        db = firestore.Client(
+            project="codepulse-507023",
+            database="codepulse"
+        )
         logger.info("✓ Firestore initialized successfully")
     except Exception as e:
         logger.error(f"✗ Failed to initialize Firestore: {e}")
         raise
-
+    
 def compute_cache_key(repo_name: str, content: str) -> str:
     """Generate cache key from repo name and content."""
     raw = f"{repo_name.strip().lower()}:{content.strip()}"
