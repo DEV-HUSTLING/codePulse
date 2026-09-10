@@ -4,6 +4,8 @@ import logging
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 from google.cloud import firestore
+from config import PROJECT_ID
+
 logger = logging.getLogger(__name__)
 
 # Initialize Firestore
@@ -13,13 +15,12 @@ def init_db():
     """Initialize Firestore connection (called once at startup)."""
     global db
     try:
-        db = firestore.Client(
-            project="codepulse-507023",
-            database="codepulse"
-        )
-        logger.info("✓ Firestore initialized successfully")
+        db = firestore.Client(project=PROJECT_ID)
+        logger.info(f"✓ Firestore initialized successfully for project: {PROJECT_ID}")
     except Exception as e:
         logger.error(f"✗ Failed to initialize Firestore: {e}")
+        logger.error(f"  Project ID: {PROJECT_ID}")
+        logger.error(f"  Make sure GOOGLE_APPLICATION_CREDENTIALS is set")
         raise
     
 def compute_cache_key(repo_name: str, content: str) -> str:
