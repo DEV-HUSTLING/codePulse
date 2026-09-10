@@ -1,104 +1,130 @@
-import sqlite3
 import hashlib
 import json
-import time
+import logging
 from typing import Optional, Dict, Any, List
-from config import DB_CACHE_PATH
+from datetime import datetime
+import firebase_admin
+from firebase_admin import credentials, firestore
 
-def get_db():
-    conn = sqlite3.connect(DB_CACHE_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+logger = logging.getLogger(__name__)
+
+# Initialize Firestore
+db = None
 
 def init_db():
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS analysis_cache (
-            cache_key TEXT PRIMARY KEY,
-            repo_name TEXT NOT NULL,
-            stars INTEGER DEFAULT 0,
-            language TEXT,
-            license TEXT,
-            overall_score INTEGER NOT NULL,
-            grade TEXT NOT NULL,
-            main_issue TEXT,
-            summary TEXT,
-            result_json TEXT NOT NULL,
-            created_at REAL NOT NULL
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_repo_name ON analysis_cache(repo_name)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_score ON analysis_cache(overall_score DESC)")
-    conn.commit()
-    conn.close()
+    """Initialize Firestore connection (called once at startup)."""
+    global db
+    try:
+        if not firebase_admin._apps:
+            # Use default credentials (automatically detects GOOGLE_APPLICATION_CREDENTIALS)
+            firebase_admin.initialize_app()
+        db = firestore.Client(project="codepulse-507023")
+        logger.info("✓ Firestore initialized successfully")
+    except Exception as e:
+        logger.error(f"✗ Failed to initialize Firestore: {e}")
+        raise
 
 def compute_cache_key(repo_name: str, content: str) -> str:
+    """Generate cache key from repo name and content."""
     raw = f"{repo_name.strip().lower()}:{content.strip()}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 def get_cached_analysis(repo_name: str, content: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    init_db()
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    if content:
-        key = compute_cache_key(repo_name, content)
-        cursor.execute("SELECT * FROM analysis_cache WHERE cache_key = ?", (key,))
-    else:
-        cursor.execute("SELECT * FROM analysis_cache WHERE repo_name = ? ORDER BY created_at DESC LIMIT 1", (repo_name,))
-        
-    row = cursor.fetchone()
-    conn.close()
-    
-    if not row:
+    """Retrieve cached analysis from Firestore."""
+    if db is None:
         return None
     
     try:
-        data = json.loads(row["result_json"])
-        data["cached"] = True
-        data["cached_at"] = row["created_at"]
-        return data
-    except Exception:
+        collection = db.collection("analysis_cache")
+        
+        if content:
+            # Look up by cache key (content-sensitive)
+            key = compute_cache_key(repo_name, content)
+            doc = collection.document(key).get()
+            if doc.exists:
+                data = doc.to_dict()
+                data["cached"] = True
+                return data
+        else:
+            # Look up by repo_name, get most recent
+            query = collection.where("repo_name", "==", repo_name).order_by(
+                "created_at", direction=firestore.Query.DESCENDING
+            ).limit(1)
+            docs = query.stream()
+            for doc in docs:
+                data = doc.to_dict()
+                data["cached"] = True
+                return data
+        
+        return None
+    except Exception as e:
+        logger.error(f"Error retrieving cached analysis for {repo_name}: {e}")
         return None
 
 def save_analysis(repo_name: str, content: str, analysis: Dict[str, Any], metadata: Optional[Dict[str, Any]] = None):
-    init_db()
-    key = compute_cache_key(repo_name, content)
-    conn = get_db()
-    cursor = conn.cursor()
+    """Save analysis result to Firestore."""
+    if db is None:
+        logger.warning("Firestore not initialized, skipping save")
+        return
     
-    stars = (metadata or {}).get("stars", analysis.get("stars", 0))
-    language = (metadata or {}).get("language", analysis.get("language", "Unknown"))
-    license_val = (metadata or {}).get("license", analysis.get("license", "Unknown"))
-    overall_score = analysis.get("overall_score", 50)
-    grade = analysis.get("grade", "Good")
-    main_issue = analysis.get("main_issue", "")
-    summary = analysis.get("summary", "")
-    result_json = json.dumps(analysis)
-    
-    cursor.execute("""
-        INSERT OR REPLACE INTO analysis_cache 
-        (cache_key, repo_name, stars, language, license, overall_score, grade, main_issue, summary, result_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (key, repo_name, stars, language, license_val, overall_score, grade, main_issue, summary, result_json, time.time()))
-    
-    conn.commit()
-    conn.close()
+    try:
+        key = compute_cache_key(repo_name, content)
+        collection = db.collection("analysis_cache")
+        
+        stars = (metadata or {}).get("stars", analysis.get("stars", 0))
+        language = (metadata or {}).get("language", analysis.get("language", "Unknown"))
+        license_val = (metadata or {}).get("license", analysis.get("license", "Unknown"))
+        overall_score = analysis.get("overall_score", 50)
+        grade = analysis.get("grade", "Good")
+        main_issue = analysis.get("main_issue", "")
+        summary = analysis.get("summary", "")
+        
+        document_data = {
+            "cache_key": key,
+            "repo_name": repo_name,
+            "stars": stars,
+            "language": language,
+            "license": license_val,
+            "overall_score": overall_score,
+            "grade": grade,
+            "main_issue": main_issue,
+            "summary": summary,
+            "result_json": json.dumps(analysis),
+            "created_at": datetime.now(),
+            "full_analysis": analysis  # Store full analysis for easier querying
+        }
+        
+        collection.document(key).set(document_data)
+        logger.info(f"Saved analysis for {repo_name} to Firestore")
+    except Exception as e:
+        logger.error(f"Error saving analysis for {repo_name}: {e}")
 
 def get_all_ranked_analyses() -> List[Dict[str, Any]]:
-    init_db()
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM analysis_cache ORDER BY overall_score DESC")
-    rows = cursor.fetchall()
-    conn.close()
+    """Retrieve all cached analyses ranked by score from Firestore."""
+    if db is None:
+        return []
     
-    results = []
-    for r in rows:
-        try:
-            item = json.loads(r["result_json"])
-            results.append(item)
-        except Exception:
-            continue
-    return results
+    try:
+        collection = db.collection("analysis_cache")
+        query = collection.order_by("overall_score", direction=firestore.Query.DESCENDING)
+        docs = query.stream()
+        
+        results = []
+        for doc in docs:
+            try:
+                data = doc.to_dict()
+                # Parse result_json if stored as string
+                if isinstance(data.get("result_json"), str):
+                    analysis = json.loads(data["result_json"])
+                else:
+                    # If full_analysis is stored, use that
+                    analysis = data.get("full_analysis", {})
+                results.append(analysis)
+            except Exception as e:
+                logger.warning(f"Error parsing cached analysis: {e}")
+                continue
+        
+        return results
+    except Exception as e:
+        logger.error(f"Error retrieving all ranked analyses: {e}")
+        return []

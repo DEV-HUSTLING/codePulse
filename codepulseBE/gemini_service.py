@@ -3,6 +3,7 @@ import json
 import logging
 from typing import Dict, Any, Optional
 from google import genai
+# pyrefly: ignore [missing-import]
 from google.genai import types
 from config import PROJECT_ID, GEMINI_MODEL, GEMINI_API_KEY, MAX_README_CHARS
 

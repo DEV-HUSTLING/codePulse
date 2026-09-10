@@ -3,12 +3,12 @@ from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
+import google.genai as genai
 import bq_service
 import gemini_service
 import scoring
 import cache_service
-from config import CATEGORY_WEIGHTS
+from config import CATEGORY_WEIGHTS, PROJECT_ID, GEMINI_API_KEY
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("codepulse")
@@ -30,6 +30,67 @@ app.add_middleware(
 # Initialize persistent cache db
 cache_service.init_db()
 
+# Track connection status
+bq_connected = False
+gemini_connected = False
+firestore_connected = False
+
+@app.on_event("startup")
+async def startup_event():
+    """Validate BigQuery, Firestore, and Gemini connections at startup."""
+    global bq_connected, gemini_connected, firestore_connected
+    
+    logger.info("=" * 50)
+    logger.info("Starting Codepulse API initialization...")
+    logger.info(f"GCP Project ID: {PROJECT_ID}")
+    logger.info(f"Gemini API Key present: {'Yes' if GEMINI_API_KEY else 'No (MISSING!)'}")
+    
+    # Test Firestore connection
+    try:
+        logger.info("Testing Firestore connection...")
+        from firebase_admin import firestore
+        fs_client = firestore.Client(project="codepulse-507023")
+        # Simple query to verify connectivity
+        collection_ref = fs_client.collection("analysis_cache")
+        docs = collection_ref.limit(1).stream()
+        list(docs)  # Consume the generator to trigger actual request
+        firestore_connected = True
+        logger.info(f"✓ Firestore connected successfully")
+    except Exception as e:
+        logger.error(f"✗ Firestore connection failed: {str(e)}")
+        logger.error("  - Ensure GOOGLE_APPLICATION_CREDENTIALS is set")
+        logger.error("  - Enable Firestore API in your GCP Project")
+    
+    # Test BigQuery connection
+    try:
+        logger.info("Testing BigQuery connection...")
+        test_query = f"SELECT COUNT(*) as cnt FROM `bigquery-public-data.github_repos.sample_repos` LIMIT 1"
+        result = list(bq_service.client.query(test_query).result())
+        bq_connected = True
+        logger.info(f"✓ BigQuery connected successfully")
+    except Exception as e:
+        logger.error(f"✗ BigQuery connection failed: {str(e)}")
+        logger.error("  - Check GOOGLE_APPLICATION_CREDENTIALS environment variable")
+        logger.error("  - Run: gcloud auth application-default login")
+        logger.error("  - Or download a service account key and set GOOGLE_APPLICATION_CREDENTIALS")
+    
+    # Test Gemini connection
+    try:
+        logger.info("Testing Gemini API connection...")
+        if not GEMINI_API_KEY:
+            logger.error("✗ GEMINI_API_KEY not set in .env or environment")
+        else:
+            genai.configure(api_key=GEMINI_API_KEY)
+            model = genai.GenerativeModel("gemini-2.5-flash")
+            # Quick test
+            response = model.generate_content("test")
+            gemini_connected = True
+            logger.info(f"✓ Gemini API connected successfully")
+    except Exception as e:
+        logger.error(f"✗ Gemini API connection failed: {str(e)}")
+    
+    logger.info("=" * 50)
+
 class AnalyzeRequest(BaseModel):
     repo_names: Optional[List[str]] = None
     repo_name: Optional[str] = None
@@ -45,10 +106,15 @@ class CustomAnalyzeRequest(BaseModel):
 @app.get("/api/health")
 def health():
     return {
-        "status": "healthy",
+        "status": "healthy" if (bq_connected and gemini_connected and firestore_connected) else "degraded",
         "service": "codepulse-analyzer",
-        "bigquery": "connected",
-        "gemini": "connected"
+        "bigquery": "connected" if bq_connected else "disconnected",
+        "gemini": "connected" if gemini_connected else "disconnected",
+        "firestore": "connected" if firestore_connected else "disconnected",
+        "details": {
+            "gcp_project_id": PROJECT_ID,
+            "check_logs": "See server logs for detailed connection errors"
+        }
     }
 
 @app.get("/api/repositories")

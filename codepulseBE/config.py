@@ -34,4 +34,4 @@ GRADE_THRESHOLDS = {
 
 # Cache & Limits
 MAX_README_CHARS = 25000
-DB_CACHE_PATH = os.path.join(os.path.dirname(__file__), "codepulse_cache.db")
+FIRESTORE_COLLECTION = "analysis_cache"
