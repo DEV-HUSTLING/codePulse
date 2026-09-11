@@ -34,7 +34,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize persistent cache db
+# Initialize persistent cache db (soft-fail — does not crash the process)
 cache_service.init_db()
 
 # Track connection status
@@ -50,7 +50,8 @@ async def startup_event():
     logger.info("=" * 50)
     logger.info("Starting Codepulse API initialization...")
     logger.info(f"GCP Project ID: {PROJECT_ID}")
-    logger.info(f"Firestore database: {FIRESTORE_DATABASE}")
+    logger.info(f"Firestore configured: {FIRESTORE_DATABASE}")
+    logger.info(f"Firestore active: {cache_service.active_database}")
     logger.info(f"BigQuery location: {BQ_LOCATION}")
     logger.info(f"Gemini API Key present: {'Yes' if GEMINI_API_KEY else 'No (will try Vertex AI)'}")
 
@@ -58,18 +59,17 @@ async def startup_event():
     try:
         logger.info("Testing Firestore connection...")
         if cache_service.db is None:
-            raise RuntimeError("Firestore client is None after init_db()")
+            raise RuntimeError(cache_service.last_init_error or "Firestore client is None")
         docs = list(cache_service.db.collection(FIRESTORE_COLLECTION).limit(1).stream())
         firestore_connected = True
         logger.info(
-            f"✓ Firestore connected (database={FIRESTORE_DATABASE}, "
+            f"✓ Firestore connected (database={cache_service.active_database}, "
             f"sample_docs={len(docs)})"
         )
     except Exception as e:
         logger.error(f"✗ Firestore connection failed: {str(e)}")
-        logger.error(f"  - Expected database id: {FIRESTORE_DATABASE}")
         logger.error("  - Ensure Cloud Run SA has roles/datastore.user")
-        logger.error("  - Or set FIRESTORE_DATABASE to match GCP Console DB id")
+        logger.error("  - Set FIRESTORE_DATABASE to match GCP Console DB id")
 
     # Test BigQuery connection
     try:
@@ -111,6 +111,7 @@ class CustomAnalyzeRequest(BaseModel):
 
 @app.get("/api/health")
 def health():
+    fs = cache_service.get_status()
     return {
         "status": "healthy" if (bq_connected and gemini_connected and firestore_connected) else "degraded",
         "service": "codepulse-analyzer",
@@ -119,13 +120,65 @@ def health():
         "firestore": "connected" if firestore_connected else "disconnected",
         "details": {
             "gcp_project_id": PROJECT_ID,
-            "firestore_database": FIRESTORE_DATABASE,
+            "firestore_database_configured": FIRESTORE_DATABASE,
+            "firestore_database_active": fs.get("active_database"),
             "firestore_collection": FIRESTORE_COLLECTION,
+            "firestore_doc_count_sample": cache_service.count_documents(50) if firestore_connected else 0,
+            "firestore_init_error": fs.get("last_init_error"),
             "bq_location": BQ_LOCATION,
             "gemini_model": GEMINI_MODEL,
             "gemini_api_key_set": bool(GEMINI_API_KEY),
             "check_logs": "See server logs for detailed connection errors"
         }
+    }
+
+
+@app.get("/api/debug")
+def debug_status():
+    """
+    Production diagnostics — safe fields only (no secrets).
+    Use this after deploy to see why insights/analyze look empty.
+    """
+    repos_ok = False
+    repos_count = 0
+    repos_error = None
+    sample_names: List[str] = []
+    try:
+        repos = bq_service.get_repositories(mode="popular", limit=3, min_stars=0)
+        repos_ok = True
+        repos_count = len(repos)
+        sample_names = [r["repo_name"] for r in repos]
+    except Exception as e:
+        repos_error = str(e)
+
+    analyses = cache_service.get_all_ranked_analyses()
+    fs = cache_service.get_status()
+
+    return {
+        "gcp_project_id": PROJECT_ID,
+        "connections": {
+            "bigquery": bq_connected,
+            "gemini": gemini_connected,
+            "firestore": firestore_connected,
+        },
+        "firestore": {
+            **fs,
+            "cached_analyses": len(analyses),
+        },
+        "bigquery_sample": {
+            "ok": repos_ok,
+            "count": repos_count,
+            "repo_names": sample_names,
+            "error": repos_error,
+            "note": "Analyze ONLY these (or other /api/repositories names). Famous repos are often missing from sample_* tables.",
+        },
+        "gemini_api_key_set": bool(GEMINI_API_KEY),
+        "next_steps": [
+            "1) GET /api/repositories?mode=popular&limit=3",
+            "2) POST /api/analyze with one of those repo_names",
+            "3) Inspect response.errors if results is empty",
+            "4) GET /api/insights — should be non-empty after a successful save",
+        ],
     }
 
 @app.get("/api/repositories")
@@ -237,7 +290,8 @@ def analyze_repositories(req: AnalyzeRequest):
                     "repo_name": clean_name,
                     "error": (
                         f"Analysis succeeded but failed to save to Firestore "
-                        f"(database={FIRESTORE_DATABASE}). Insights will stay empty."
+                        f"(database={cache_service.active_database or FIRESTORE_DATABASE}). "
+                        f"Insights will stay empty."
                     )
                 })
             results.append(analysis_record)
@@ -283,7 +337,7 @@ def get_rankings():
     payload = {
         "rankings": ranked,
         "total": len(ranked),
-        "firestore_database": FIRESTORE_DATABASE,
+        "firestore_database": cache_service.active_database or FIRESTORE_DATABASE,
     }
     if cache_service.last_read_error:
         payload["error"] = cache_service.last_read_error
@@ -308,16 +362,17 @@ def get_insights():
             "category_averages": {},
             "common_weaknesses": [],
             "insights_list": [],
-            "firestore_database": FIRESTORE_DATABASE,
+            "firestore_database": cache_service.active_database or FIRESTORE_DATABASE,
             "hint": (
                 "Insights come from Firestore analysis_cache, not BigQuery. "
-                "Run POST /api/analyze on repos from GET /api/repositories first. "
-                "If you already analyzed, verify FIRESTORE_DATABASE matches the DB "
-                "in GCP Console and check Cloud Run logs for save/read errors."
+                "Call GET /api/debug then POST /api/analyze using a repo from "
+                "bigquery_sample.repo_names. Check response.errors."
             ),
         }
         if cache_service.last_read_error:
             empty["error"] = cache_service.last_read_error
+        if cache_service.last_init_error:
+            empty["firestore_init_error"] = cache_service.last_init_error
         return empty
 
     total_score = sum(a.get("overall_score", 0) for a in analyses)

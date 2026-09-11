@@ -88,7 +88,9 @@ MIT License © 2026 SuperAgent Team`
       setSelectedRepos(repos.map(r => r.repo_name));
     } catch (err: any) {
       console.error("Failed to fetch repositories:", err);
-      setErrorMessage("Could not connect to BigQuery repository service. Ensure the backend server is running.");
+      setErrorMessage(
+        "Could not reach the backend / BigQuery API. If this is a deployed frontend, set BACKEND_URL to your Cloud Run URL and redeploy. Locally, start uvicorn on port 8000."
+      );
     } finally {
       setIsLoadingRepos(false);
     }
@@ -112,6 +114,9 @@ MIT License © 2026 SuperAgent Team`
       if (insightsRes.ok) {
         const insData = await insightsRes.json();
         setInsights(insData);
+        if ((!insData.total_analyzed || insData.total_analyzed === 0) && (insData.error || insData.hint)) {
+          console.warn("Insights empty:", insData.error || insData.hint);
+        }
       }
     } catch (err) {
       console.error("Failed to load existing rankings:", err);
