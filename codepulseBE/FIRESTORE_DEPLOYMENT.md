@@ -69,12 +69,14 @@ gcloud run deploy codepulse-backend \
   --region=us-central1 \
   --service-account=codepulse-backend@codepulse-507023.iam.gserviceaccount.com \
   --update-secrets "GEMINI_API_KEY=gemini-api-key:latest" \
-  --set-env-vars "GCP_PROJECT_ID=codepulse-507023,BQ_LOCATION=US,GEMINI_MODEL=gemini-2.5-flash" \
+  --set-env-vars 'GCP_PROJECT_ID=codepulse-507023,BQ_LOCATION=US,GEMINI_MODEL=gemini-2.5-flash,FIRESTORE_DATABASE=(default)' \
   --memory=512Mi \
   --cpu=1 \
   --timeout=300 \
   --allow-unauthenticated
 ```
+
+> If your Firestore DB is a **named** database (e.g. `codepulse`), set `FIRESTORE_DATABASE=codepulse` instead of `(default)`. Health and cache must use the same ID.
 
 ### **4. Grant Service Account Firestore Access**
 
@@ -122,14 +124,19 @@ Returns empty insights (no analyses yet):
 
 ### **3. Pre-populate Cache**
 
-Analyze 2-3 repositories to populate cache:
+**Important:** Data comes from BigQuery **sample** tables (`github_repos.sample_*`), not the full GitHub corpus. Famous repos like `kubernetes/kubernetes` are often missing. Always pick names from `/api/repositories` first:
+
 ```bash
+# 1) Get repos that actually exist in the sample dataset
+curl "https://YOUR_CLOUD_RUN_URL/api/repositories?mode=mixed&limit=5"
+
+# 2) Analyze those exact repo_name values (inspect "errors" in the response)
 curl -X POST https://YOUR_CLOUD_RUN_URL/api/analyze \
   -H "Content-Type: application/json" \
-  -d '{"repo_names": ["kubernetes/kubernetes", "golang/go", "torvalds/linux"]}'
+  -d '{"repo_names": ["REPLACE/WITH_NAME_FROM_STEP_1"]}'
 ```
 
-Wait 2-5 minutes for Gemini analysis to complete.
+Wait for Gemini analysis to complete. If `results` is empty, read `errors` — do not assume success from HTTP 200.
 
 ### **4. Check `/api/insights` Again**
 
@@ -239,6 +246,50 @@ gcloud run deploy codepulse-backend --image=... --region=us-central1
 ```bash
 gcloud run logs read codepulse-backend --region=us-central1 --limit=100
 ```
+
+---
+
+## **GCP Production Checklist (empty analyze / insights)**
+
+Work through these in order after redeploying the fixed image.
+
+### A. Confirm what “empty” means
+- [ ] `GET /api/health` → note `firestore`, `bigquery`, `gemini`, and `details.firestore_database`
+- [ ] `GET /api/repositories?mode=mixed&limit=5` → must return repos (proves BigQuery jobs work)
+- [ ] `GET /api/insights` → if empty, check `error` / `hint` fields (insights are Firestore-only)
+- [ ] `POST /api/analyze` with a `repo_name` from step 2 → inspect **`errors`**, not only `results`
+
+### B. Firestore (most common cause of empty insights)
+- [ ] `gcloud firestore databases list --project=codepulse-507023` → note DB id (`(default)` vs `codepulse`)
+- [ ] Cloud Run env `FIRESTORE_DATABASE` **exactly** matches that id
+- [ ] Console → Firestore → select that DB → collection `analysis_cache` has documents after analyze
+- [ ] SA has `roles/datastore.user`:
+  ```bash
+  gcloud projects add-iam-policy-binding codepulse-507023 \
+    --member="serviceAccount:codepulse-backend@codepulse-507023.iam.gserviceaccount.com" \
+    --role="roles/datastore.user"
+  ```
+- [ ] Firestore API enabled: `gcloud services enable firestore.googleapis.com`
+
+### C. BigQuery (analyze README fetch)
+- [ ] SA has `roles/bigquery.jobUser` and `roles/bigquery.dataViewer`
+- [ ] Cloud Run env `GCP_PROJECT_ID=codepulse-507023`, `BQ_LOCATION=US`
+- [ ] Only analyze repos returned by `/api/repositories` (sample dataset, not full GitHub)
+
+### D. Gemini (analyze AI step)
+- [ ] Secret `gemini-api-key` exists and is mounted as `GEMINI_API_KEY` on Cloud Run
+- [ ] Or SA has Vertex AI access (`roles/aiplatform.user`) if not using API key
+- [ ] Health `details.gemini_api_key_set` is `true` when using Secret Manager
+
+### E. Frontend → backend wiring
+- [ ] Deployed frontend `BACKEND_URL` points at the Cloud Run URL (not `127.0.0.1`)
+- [ ] CORS is open on backend (`allow_origins=["*"]` already)
+
+### F. Logs
+```bash
+gcloud run services logs read codepulse-backend --region=us-central1 --limit=100
+```
+Look for: Firestore init/save errors, BigQuery permission errors, Gemini failures.
 
 ---
 

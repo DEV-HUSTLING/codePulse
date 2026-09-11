@@ -3,12 +3,19 @@ from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import google.genai as genai
 import bq_service
 import gemini_service
 import scoring
 import cache_service
-from config import CATEGORY_WEIGHTS, PROJECT_ID, GEMINI_API_KEY
+from config import (
+    CATEGORY_WEIGHTS,
+    PROJECT_ID,
+    GEMINI_API_KEY,
+    FIRESTORE_DATABASE,
+    FIRESTORE_COLLECTION,
+    BQ_LOCATION,
+    GEMINI_MODEL,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("codepulse")
@@ -39,56 +46,55 @@ firestore_connected = False
 async def startup_event():
     """Validate BigQuery, Firestore, and Gemini connections at startup."""
     global bq_connected, gemini_connected, firestore_connected
-    
+
     logger.info("=" * 50)
     logger.info("Starting Codepulse API initialization...")
     logger.info(f"GCP Project ID: {PROJECT_ID}")
-    logger.info(f"Gemini API Key present: {'Yes' if GEMINI_API_KEY else 'No (MISSING!)'}")
-    
-    # Test Firestore connection
+    logger.info(f"Firestore database: {FIRESTORE_DATABASE}")
+    logger.info(f"BigQuery location: {BQ_LOCATION}")
+    logger.info(f"Gemini API Key present: {'Yes' if GEMINI_API_KEY else 'No (will try Vertex AI)'}")
+
+    # Test Firestore with the SAME client/database used at runtime
     try:
         logger.info("Testing Firestore connection...")
-        from firebase_admin import firestore
-        fs_client = firestore.Client(project="codepulse-507023", database="codepulse")
-        # Simple query to verify connectivity
-        collection_ref = fs_client.collection("analysis_cache")
-        docs = collection_ref.limit(1).stream()
-        list(docs)  # Consume the generator to trigger actual request
+        if cache_service.db is None:
+            raise RuntimeError("Firestore client is None after init_db()")
+        docs = list(cache_service.db.collection(FIRESTORE_COLLECTION).limit(1).stream())
         firestore_connected = True
-        logger.info(f"✓ Firestore connected successfully")
+        logger.info(
+            f"✓ Firestore connected (database={FIRESTORE_DATABASE}, "
+            f"sample_docs={len(docs)})"
+        )
     except Exception as e:
         logger.error(f"✗ Firestore connection failed: {str(e)}")
-        logger.error("  - Ensure GOOGLE_APPLICATION_CREDENTIALS is set")
-        logger.error("  - Enable Firestore API in your GCP Project")
-    
+        logger.error(f"  - Expected database id: {FIRESTORE_DATABASE}")
+        logger.error("  - Ensure Cloud Run SA has roles/datastore.user")
+        logger.error("  - Or set FIRESTORE_DATABASE to match GCP Console DB id")
+
     # Test BigQuery connection
     try:
         logger.info("Testing BigQuery connection...")
-        test_query = f"SELECT COUNT(*) as cnt FROM `bigquery-public-data.github_repos.sample_repos` LIMIT 1"
-        result = list(bq_service.client.query(test_query).result())
+        test_query = "SELECT COUNT(*) as cnt FROM `bigquery-public-data.github_repos.sample_repos` LIMIT 1"
+        list(bq_service.client.query(test_query).result())
         bq_connected = True
-        logger.info(f"✓ BigQuery connected successfully")
+        logger.info("✓ BigQuery connected successfully")
     except Exception as e:
         logger.error(f"✗ BigQuery connection failed: {str(e)}")
-        logger.error("  - Check GOOGLE_APPLICATION_CREDENTIALS environment variable")
-        logger.error("  - Run: gcloud auth application-default login")
-        logger.error("  - Or download a service account key and set GOOGLE_APPLICATION_CREDENTIALS")
-    
-    # Test Gemini connection
+        logger.error("  - Cloud Run SA needs roles/bigquery.jobUser + bigquery.dataViewer")
+        logger.error("  - Locally: gcloud auth application-default login")
+
+    # Test Gemini with the same Client API used by gemini_service
     try:
         logger.info("Testing Gemini API connection...")
-        if not GEMINI_API_KEY:
-            logger.error("✗ GEMINI_API_KEY not set in .env or environment")
-        else:
-            genai.configure(api_key=GEMINI_API_KEY)
-            model = genai.GenerativeModel("gemini-2.5-flash")
-            # Quick test
-            response = model.generate_content("test")
-            gemini_connected = True
-            logger.info(f"✓ Gemini API connected successfully")
+        client = gemini_service.get_ai_client()
+        client.models.generate_content(model=GEMINI_MODEL, contents="ping")
+        gemini_connected = True
+        logger.info(f"✓ Gemini connected successfully (model={GEMINI_MODEL})")
     except Exception as e:
         logger.error(f"✗ Gemini API connection failed: {str(e)}")
-    
+        if not GEMINI_API_KEY:
+            logger.error("  - Mount GEMINI_API_KEY from Secret Manager, or grant Vertex AI User")
+
     logger.info("=" * 50)
 
 class AnalyzeRequest(BaseModel):
@@ -113,6 +119,11 @@ def health():
         "firestore": "connected" if firestore_connected else "disconnected",
         "details": {
             "gcp_project_id": PROJECT_ID,
+            "firestore_database": FIRESTORE_DATABASE,
+            "firestore_collection": FIRESTORE_COLLECTION,
+            "bq_location": BQ_LOCATION,
+            "gemini_model": GEMINI_MODEL,
+            "gemini_api_key_set": bool(GEMINI_API_KEY),
             "check_logs": "See server logs for detailed connection errors"
         }
     }
@@ -219,8 +230,16 @@ def analyze_repositories(req: AnalyzeRequest):
                 "cached": False
             }
 
-            # 6. Save to cache
-            cache_service.save_analysis(clean_name, content, analysis_record, readme_data)
+            # 6. Save to cache (insights/rankings depend on this)
+            saved = cache_service.save_analysis(clean_name, content, analysis_record, readme_data)
+            if not saved:
+                errors.append({
+                    "repo_name": clean_name,
+                    "error": (
+                        f"Analysis succeeded but failed to save to Firestore "
+                        f"(database={FIRESTORE_DATABASE}). Insights will stay empty."
+                    )
+                })
             results.append(analysis_record)
 
         except Exception as e:
@@ -258,18 +277,28 @@ def get_analysis_by_repo(owner: str, repo: str):
 def get_rankings():
     """
     Returns all analyzed repositories ranked by documentation health score.
+    Reads Firestore cache only — not BigQuery.
     """
     ranked = cache_service.get_all_ranked_analyses()
-    return {"rankings": ranked, "total": len(ranked)}
+    payload = {
+        "rankings": ranked,
+        "total": len(ranked),
+        "firestore_database": FIRESTORE_DATABASE,
+    }
+    if cache_service.last_read_error:
+        payload["error"] = cache_service.last_read_error
+    return payload
 
 @app.get("/api/insights")
 def get_insights():
     """
     Computes comparative insights across all analyzed repositories.
+    Reads Firestore cache only — not BigQuery. Empty until /api/analyze
+    successfully saves documents to analysis_cache.
     """
     analyses = cache_service.get_all_ranked_analyses()
     if not analyses:
-        return {
+        empty = {
             "total_analyzed": 0,
             "average_score": 0,
             "top_performer": None,
@@ -278,8 +307,18 @@ def get_insights():
             "low_star_high_doc": None,
             "category_averages": {},
             "common_weaknesses": [],
-            "insights_list": []
+            "insights_list": [],
+            "firestore_database": FIRESTORE_DATABASE,
+            "hint": (
+                "Insights come from Firestore analysis_cache, not BigQuery. "
+                "Run POST /api/analyze on repos from GET /api/repositories first. "
+                "If you already analyzed, verify FIRESTORE_DATABASE matches the DB "
+                "in GCP Console and check Cloud Run logs for save/read errors."
+            ),
         }
+        if cache_service.last_read_error:
+            empty["error"] = cache_service.last_read_error
+        return empty
 
     total_score = sum(a.get("overall_score", 0) for a in analyses)
     avg_score = round(total_score / len(analyses), 1)

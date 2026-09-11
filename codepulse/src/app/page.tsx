@@ -241,7 +241,15 @@ MIT License © 2026 SuperAgent Team`
               [...prev, ...newResults].forEach(item => map.set(item.repo_name, item));
               return Array.from(map.values()).sort((a, b) => b.overall_score - a.overall_score);
             });
+          } else if (data.errors && data.errors.length > 0) {
+            const msg = data.errors.map((e: { repo_name?: string; error?: string }) =>
+              `${e.repo_name || repoName}: ${e.error || "unknown error"}`
+            ).join("; ");
+            setErrorMessage(msg);
           }
+        } else {
+          const body = await res.text();
+          setErrorMessage(`Analyze failed (${res.status}): ${body.slice(0, 300)}`);
         }
 
         setCurrentStep(3); // Scoring & Caching

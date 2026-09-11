@@ -1,12 +1,13 @@
 import logging
 from typing import List, Dict, Any, Optional
 from google.cloud import bigquery
-from config import PROJECT_ID
+from config import PROJECT_ID, BQ_LOCATION
 
 logger = logging.getLogger(__name__)
 
 # Initialize client using existing GCP credentials & project
-client = bigquery.Client(project=PROJECT_ID)
+# Location must match the public GitHub dataset (US)
+client = bigquery.Client(project=PROJECT_ID, location=BQ_LOCATION)
 
 def get_repositories(mode: str = "mixed", limit: int = 10, min_stars: int = 0) -> List[Dict[str, Any]]:
     """
@@ -176,7 +177,7 @@ def get_readme(repo_name: str) -> Optional[Dict[str, Any]]:
         results = list(client.query(query, job_config=job_config).result())
         if not results:
             return None
-        
+
         row = results[0]
         parts = clean_repo.split("/") if "/" in clean_repo else ["", clean_repo]
         return {
@@ -192,5 +193,7 @@ def get_readme(repo_name: str) -> Optional[Dict[str, Any]]:
             "repo_url": f"https://github.com/{clean_repo}"
         }
     except Exception as e:
+        # Re-raise so /api/analyze surfaces the real BQ/IAM error instead of
+        # treating it as "No README content found"
         logger.error(f"Error fetching README for {clean_repo} from BigQuery: {e}")
-        return None
+        raise

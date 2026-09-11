@@ -7,6 +7,8 @@ load_dotenv()
 # GCP & BigQuery Configuration
 PROJECT_ID = os.getenv("GCP_PROJECT_ID", "codepulse-507023")
 BQ_LOCATION = os.getenv("BQ_LOCATION", "US")
+# Must match the Firestore DB ID in GCP Console — "(default)" or a named DB e.g. "codepulse"
+FIRESTORE_DATABASE = os.getenv("FIRESTORE_DATABASE", "(default)")
 
 # Gemini Model Configuration
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
